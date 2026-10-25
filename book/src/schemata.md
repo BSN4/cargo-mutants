@@ -71,4 +71,8 @@ Doctests aren't run by nextest, so a mutant reached only by doctests is reported
   abandoned.
 - The generated code may trigger lints such as `unused_parens`; if your tree denies warnings,
   use [`--cap-lints=true`](lints.md).
-- `--schemata` has no effect with `--check` or `--in-place`.
+- `--schemata` has no effect with `--check`.
+- With [`--in-place`](in-place.md), the schemata are written into your source files while their
+  mutants are tested, and the files are restored afterwards, including when the run is
+  interrupted with Ctrl-C. If cargo-mutants is killed outright, restore them with
+  `git checkout`, just as for an ordinary in-place mutant.

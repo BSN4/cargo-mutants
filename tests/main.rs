@@ -9,7 +9,6 @@
 )]
 
 use std::collections::HashSet;
-use std::env;
 use std::fs::{self, File, create_dir, create_dir_all, read_dir, read_to_string, rename, write};
 use std::io::Write as IoWrite;
 use std::path::Path;
@@ -3963,4 +3962,24 @@ fn cache_reuses_outcomes_of_unchanged_mutants_on_second_run() {
         .success()
         .stdout(contains("4 caught"));
     assert!(out.join("log/baseline.log").is_file());
+}
+
+#[test]
+fn schemata_in_place_restores_source_files() {
+    let tmp_src_dir = copy_of_testdata("small_well_tested");
+    let original = read_to_string(tmp_src_dir.path().join("src/lib.rs")).unwrap();
+    run()
+        .args(["mutants", "--schemata", "--in-place", "--no-shuffle"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success()
+        .stdout(
+            contains("Testing 4 mutants in one schemata build; 0 will be built separately")
+                .and(contains("4 caught")),
+        );
+    assert_eq!(
+        read_to_string(tmp_src_dir.path().join("src/lib.rs")).unwrap(),
+        original
+    );
 }

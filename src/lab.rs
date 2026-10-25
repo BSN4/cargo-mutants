@@ -423,10 +423,6 @@ impl Lab<'_> {
             warn!("--schemata has no effect with --check");
             return Ok(mutants);
         }
-        if self.options.in_place {
-            warn!("--schemata is not supported with --in-place, so it's ignored");
-            return Ok(mutants);
-        }
         let files: BTreeMap<Utf8PathBuf, SourceFile> = mutants
             .iter()
             .filter(|mutant| mutant.switch.is_some())
