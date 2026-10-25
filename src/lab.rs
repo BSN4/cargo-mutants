@@ -6,10 +6,10 @@
 #![warn(clippy::pedantic)]
 
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{create_dir_all, read_to_string};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{create_dir_all, read_to_string, remove_dir_all};
 use std::panic::resume_unwind;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{thread, vec};
 
@@ -31,14 +31,20 @@ use crate::{
     package::PackageSelection,
     process::Exit,
     schemata::{self, ACTIVE_ENV},
-    source::SourceFile,
-    test_select::{Coverage, KillHistory, TRACE_ENV, TestId, failed_tests, filterset_args},
-    timeouts::Timeouts,
+    test_select::{
+        Coverage, KillHistory, TRACE_ENV, TestId, failed_tests, listed_tests, test_args,
+        test_durations, total_duration,
+    },
+    timeouts::{Timeouts, selected_tests_timeout},
     workspace::Workspace,
 };
 
 /// The most times to build the schemata, leaving out mutants that cause errors each time.
 const MAX_SCHEMATA_ROUNDS: usize = 10;
+
+/// The most times to run the tests in the schemata build with no mutant active, leaving out
+/// tests that fail each time.
+const MAX_SCHEMATA_BASELINE_ROUNDS: usize = 5;
 
 /// Run all possible mutation experiments.
 ///
@@ -88,6 +94,9 @@ pub fn test_mutants(
         jobserver,
         tests_for_mutant,
         kill_history: Mutex::default(),
+        test_durations: OnceLock::new(),
+        schemata_skipped_tests: OnceLock::new(),
+        schemata_recheck: Mutex::default(),
         cache,
         options,
         console,
@@ -195,6 +204,21 @@ fn join_threads(threads: Vec<thread::ScopedJoinHandle<'_, Result<()>>>) -> Resul
     }
 }
 
+/// Options for a test run that doesn't stop at the first failure, at either cargo's or libtest's
+/// level, so that one run finds every test that fails, and every test's duration.
+fn without_fail_fast(options: &Options) -> Options {
+    let mut options = options.clone();
+    options
+        .additional_cargo_args
+        .push("--no-fail-fast".to_owned());
+    let test_args = &mut options.additional_cargo_test_args;
+    if let Some(separator) = test_args.iter().position(|a| a == "--") {
+        let binary_args = test_args.split_off(separator);
+        test_args.extend(binary_args.into_iter().filter(|a| a != "--fail-fast"));
+    }
+    options
+}
+
 /// Return the packages containing any of these mutants, in a stable order.
 fn mutated_packages(mutants: &[Mutant]) -> Vec<Arc<Package>> {
     mutants
@@ -230,8 +254,22 @@ impl Job {
 enum SchemataBaseline {
     /// The tests failed, so the schemata can't be used.
     Failed,
-    /// The tests passed, and the tests reaching each mutant were recorded if possible.
-    Passed { coverage: Option<Coverage> },
+    /// The tests passed, and the tests reaching each mutant were recorded.
+    Passed { coverage: Coverage },
+}
+
+/// The result of a cargo command that's part of setting up the schemata.
+struct TaskResult {
+    success: bool,
+    log: String,
+    duration: Duration,
+}
+
+/// How long tests took in the schemata baseline, to set timeouts for running some of them.
+struct TestDurations {
+    durations: HashMap<TestId, Duration>,
+    /// The time a run of tests takes apart from the tests themselves.
+    overhead: Duration,
 }
 
 /// The results cache, and what's needed to compute keys into it.
@@ -273,6 +311,13 @@ struct Lab<'a> {
     tests_for_mutant: TestsForMutant,
     /// Which tests caught which mutants, to choose which tests to run first.
     kill_history: Mutex<KillHistory>,
+    /// How long each test took in the schemata baseline, once it has run.
+    test_durations: OnceLock<TestDurations>,
+    /// Tests that fail in the schemata build with no mutant active, and so are skipped there.
+    schemata_skipped_tests: OnceLock<Vec<TestId>>,
+    /// Mutants missed in the schemata build while some tests were skipped, to be checked again
+    /// in a build of their own.
+    schemata_recheck: Mutex<Vec<Mutant>>,
     cache: Option<LabCache>,
     options: &'a Options,
     console: &'a Console,
@@ -423,19 +468,34 @@ impl Lab<'_> {
             warn!("--schemata has no effect with --check");
             return Ok(mutants);
         }
-        let files: BTreeMap<Utf8PathBuf, SourceFile> = mutants
+        // The original text of every file the schemata change: those with switched mutants,
+        // and the crate roots, which get an alias for the standard library.
+        let switched = mutants
             .iter()
             .filter(|mutant| mutant.switch.is_some())
-            .map(|mutant| {
-                (
-                    mutant.source_file.tree_relative_path.clone(),
-                    mutant.source_file.clone(),
-                )
-            })
+            .cloned()
+            .collect_vec();
+        let mut originals: BTreeMap<Utf8PathBuf, String> = BTreeMap::new();
+        for mutant in &switched {
+            originals
+                .entry(mutant.source_file.tree_relative_path.clone())
+                .or_insert_with(|| mutant.source_file.code().to_owned());
+        }
+        let crate_roots: BTreeSet<Utf8PathBuf> = mutated_packages(&switched)
+            .iter()
+            .flat_map(|package| package.top_sources.iter().cloned())
             .collect();
-        let result = self.build_and_test_schemata(build_dir, mutants, &files, timeouts);
-        for (path, source_file) in &files {
-            build_dir.overwrite_file(path, source_file.code())?;
+        for root in &crate_roots {
+            if !originals.contains_key(root) {
+                let path = build_dir.path().join(root);
+                let code = read_to_string(&path).with_context(|| format!("read {path}"))?;
+                originals.insert(root.clone(), code);
+            }
+        }
+        let result =
+            self.build_and_test_schemata(build_dir, mutants, &originals, &crate_roots, timeouts);
+        for (path, code) in &originals {
+            build_dir.overwrite_file(path, code)?;
         }
         result
     }
@@ -444,11 +504,19 @@ impl Lab<'_> {
         &self,
         build_dir: &BuildDir,
         mutants: Vec<Mutant>,
-        files: &BTreeMap<Utf8PathBuf, SourceFile>,
+        originals: &BTreeMap<Utf8PathBuf, String>,
+        crate_roots: &BTreeSet<Utf8PathBuf>,
         timeouts: Timeouts,
     ) -> Result<Vec<Mutant>> {
         let packages = self.schemata_packages(&mutants);
-        let ids = self.build_schemata(build_dir, &mutants, files, &packages, timeouts)?;
+        let ids = self.build_schemata(
+            build_dir,
+            &mutants,
+            originals,
+            crate_roots,
+            &packages,
+            timeouts,
+        )?;
         if ids.is_empty() {
             return Ok(mutants);
         }
@@ -464,7 +532,7 @@ impl Lab<'_> {
                 jobs.push(Job {
                     mutant,
                     schemata_id: Some(id),
-                    tests: coverage.as_ref().and_then(|c| c.tests_for(id)),
+                    tests: coverage.tests_for(id),
                 });
             } else {
                 separate.push(mutant);
@@ -491,6 +559,12 @@ impl Lab<'_> {
                 .collect_vec();
             join_threads(threads)
         })?;
+        separate.extend(
+            self.schemata_recheck
+                .lock()
+                .expect("lock recheck")
+                .drain(..),
+        );
         Ok(separate)
     }
 
@@ -503,7 +577,8 @@ impl Lab<'_> {
         &self,
         build_dir: &BuildDir,
         mutants: &[Mutant],
-        files: &BTreeMap<Utf8PathBuf, SourceFile>,
+        originals: &BTreeMap<Utf8PathBuf, String>,
+        crate_roots: &BTreeSet<Utf8PathBuf>,
         packages: &PackageSelection,
         timeouts: Timeouts,
     ) -> Result<BTreeSet<usize>> {
@@ -513,17 +588,22 @@ impl Lab<'_> {
             .filter(|(_, mutant)| mutant.switch.is_some())
             .map(|(i, _)| i + 1)
             .collect();
+        let in_file =
+            |id: usize, path: &Utf8Path| mutants[id - 1].source_file.tree_relative_path == path;
         for round in 1..=MAX_SCHEMATA_ROUNDS {
             let mut generated = BTreeMap::new();
-            for (path, source_file) in files {
+            for (path, original) in originals {
                 let file_mutants = enabled
                     .iter()
+                    .filter(|&&id| in_file(id, path))
                     .map(|&id| (id, &mutants[id - 1]))
-                    .filter(|(_, mutant)| mutant.source_file.tree_relative_path == *path)
                     .collect_vec();
-                let schemata = schemata::generate(source_file.code(), &file_mutants);
+                let mut schemata = schemata::generate(original, &file_mutants);
                 for id in &schemata.unswitched {
                     enabled.remove(id);
+                }
+                if crate_roots.contains(path) {
+                    schemata.code.push_str(schemata::CRATE_ROOT_SUFFIX);
                 }
                 build_dir.overwrite_file(path, &schemata.code)?;
                 generated.insert(path.as_path(), schemata);
@@ -532,7 +612,7 @@ impl Lab<'_> {
                 return Ok(enabled);
             }
             let log_name = format!("schemata_build_{round}");
-            let (success, log) = self.run_task(
+            let task = self.run_task(
                 build_dir,
                 &log_name,
                 Phase::Build,
@@ -540,8 +620,9 @@ impl Lab<'_> {
                 timeouts.build,
                 &json_message_format_args(self.options),
                 &[],
+                self.options,
             )?;
-            if success {
+            if task.success {
                 info!(
                     round,
                     "Built {} in one schemata build",
@@ -550,22 +631,33 @@ impl Lab<'_> {
                 return Ok(enabled);
             }
             let mut blamed = BTreeSet::new();
-            for location in schemata::error_locations(&log) {
-                let path =
-                    schemata::tree_relative_error_path(&location.file_name, build_dir.path());
-                let Some(schemata) = generated.get(path) else {
-                    continue;
-                };
-                if let Some(ids) = schemata.blame(location.byte_offset) {
+            let mut attributed_files = BTreeSet::new();
+            let mut unattributed_files = BTreeSet::new();
+            for locations in schemata::error_locations(&task.log) {
+                // Blame the mutants at the first location, most relevant first, that's in one.
+                let blame = locations.iter().find_map(|location| {
+                    let path =
+                        schemata::tree_relative_error_path(&location.file_name, build_dir.path());
+                    let ids = generated.get(path)?.blame(location.byte_offset)?;
+                    Some((path.to_owned(), ids))
+                });
+                if let Some((path, ids)) = blame {
                     blamed.extend(ids.iter().copied());
-                } else {
-                    // An error outside any mutant, so we can't tell which caused it.
-                    blamed.extend(
-                        enabled
-                            .iter()
-                            .filter(|&&id| mutants[id - 1].source_file.tree_relative_path == path),
-                    );
+                    attributed_files.insert(path);
+                } else if let Some(primary) = locations.first() {
+                    let path =
+                        schemata::tree_relative_error_path(&primary.file_name, build_dir.path());
+                    if generated.contains_key(path) {
+                        unattributed_files.insert(path.to_owned());
+                    }
                 }
+            }
+            // An error outside any mutant can't be traced to one. If other errors in the same
+            // file were, it's most likely a consequence of them, such as a name that a broken
+            // mutant failed to define, so it should go away in the next round. Otherwise, all
+            // the file's mutants are left out.
+            for path in unattributed_files.difference(&attributed_files) {
+                blamed.extend(enabled.iter().filter(|&&id| in_file(id, path)));
             }
             blamed.retain(|id| enabled.contains(id));
             if blamed.is_empty() {
@@ -587,55 +679,224 @@ impl Lab<'_> {
         Ok(BTreeSet::new())
     }
 
+    /// Whether the user's test arguments enable libtest's unstable options, such as
+    /// `--report-time`.
+    fn unstable_test_options(&self) -> bool {
+        let args = &self.options.additional_cargo_test_args;
+        args.iter().any(|a| a == "-Zunstable-options")
+            || args
+                .windows(2)
+                .any(|pair| pair[0] == "-Z" && pair[1] == "unstable-options")
+    }
+
     /// Run the tests in the schemata build with no mutant active, to check that the
-    /// schemata don't change behavior, and with nextest, record which tests reach which mutants.
+    /// schemata don't change behavior, and record which tests reach which mutants and how
+    /// long each test takes.
     fn run_schemata_baseline(
         &self,
         build_dir: &BuildDir,
         packages: &PackageSelection,
         timeouts: Timeouts,
     ) -> Result<SchemataBaseline> {
-        // Only nextest runs each test in its own process, which is needed to tell which test
-        // reached each mutant.
-        let trace_dir = if matches!(self.options.test_tool(), TestTool::Nextest) {
-            let output_path = self
-                .output_mutex
-                .lock()
-                .expect("lock output dir")
-                .path()
-                .join("schemata_coverage");
-            create_dir_all(&output_path).with_context(|| format!("create {output_path}"))?;
-            // Tests run in the build dir, so the path must be absolute.
-            Some(output_path.canonicalize_utf8()?)
-        } else {
-            None
-        };
-        let env = trace_dir
-            .iter()
-            .map(|dir| (TRACE_ENV.to_owned(), dir.to_string()))
-            .collect_vec();
-        let (success, _log) = self.run_task(
-            build_dir,
-            "schemata_baseline",
-            Phase::Test,
-            packages,
-            timeouts.test,
-            &[],
-            &env,
-        )?;
-        if !success {
-            warn!(
-                "Tests failed in the schemata build with no mutant active, so all mutants will be built separately: see mutants.out/log/schemata_baseline.log"
+        let output_path = self
+            .output_mutex
+            .lock()
+            .expect("lock output dir")
+            .path()
+            .join("schemata_coverage");
+        create_dir_all(&output_path).with_context(|| format!("create {output_path}"))?;
+        // Tests run in the build dir, so the path must be absolute.
+        let trace_dir = output_path.canonicalize_utf8()?;
+        let test_tool = self.options.test_tool();
+        let (known_tests, overhead) = self.list_tests(build_dir, packages, timeouts)?;
+        let report_time = matches!(test_tool, TestTool::Cargo) && self.unstable_test_options();
+        // Tests that fail with no mutant active, for example because they count allocations
+        // and the schemata's tracing allocates, are left out of every schemata run, and any
+        // mutant missed there is checked again in a build of its own.
+        let mut skipped: Vec<TestId> = Vec::new();
+        let mut round = 1;
+        let baseline_options = without_fail_fast(self.options);
+        let task = loop {
+            if trace_dir.exists() {
+                remove_dir_all(&trace_dir).with_context(|| format!("remove {trace_dir}"))?;
+            }
+            create_dir_all(&trace_dir).with_context(|| format!("create {trace_dir}"))?;
+            let Some(mut args) = test_args(test_tool, None, &skipped) else {
+                warn!(
+                    "Can't name the tests that fail in the schemata build to skip them, so all mutants will be built separately"
+                );
+                return Ok(SchemataBaseline::Failed);
+            };
+            if report_time {
+                if args.is_empty() {
+                    args.push("--".to_owned());
+                }
+                args.push("--report-time".to_owned());
+            }
+            let log_name = if round == 1 {
+                "schemata_baseline".to_owned()
+            } else {
+                format!("schemata_baseline_{round}")
+            };
+            let task = self.run_task(
+                build_dir,
+                &log_name,
+                Phase::Test,
+                packages,
+                timeouts.test,
+                &args,
+                &[(TRACE_ENV.to_owned(), trace_dir.to_string())],
+                &baseline_options,
+            )?;
+            if task.success {
+                break task;
+            }
+            let new_failures = failed_tests(&task.log)
+                .into_iter()
+                .filter(|test| !skipped.contains(test))
+                .collect_vec();
+            if new_failures.is_empty() || round == MAX_SCHEMATA_BASELINE_ROUNDS {
+                warn!(
+                    "Tests failed in the schemata build with no mutant active, so all mutants will be built separately: see mutants.out/log/{log_name}.log"
+                );
+                return Ok(SchemataBaseline::Failed);
+            }
+            info!(
+                "{} failed in the schemata build with no mutant active, so they're skipped there, and mutants missed there are checked again in a build of their own: {}",
+                plural(new_failures.len(), "test"),
+                new_failures
+                    .iter()
+                    .map(|test| test.name.as_str())
+                    .join(", "),
             );
-            return Ok(SchemataBaseline::Failed);
-        }
-        let coverage = trace_dir.map(|dir| Coverage::read(&dir)).transpose()?;
+            skipped.extend(new_failures);
+            round += 1;
+        };
+        let _ = self.schemata_skipped_tests.set(skipped);
+        let durations = test_durations(&task.log);
+        debug!(
+            n_durations = durations.len(),
+            ?overhead,
+            "read test durations from schemata baseline"
+        );
+        let _ = self.test_durations.set(TestDurations {
+            durations,
+            overhead,
+        });
+        let coverage = Coverage::read(&trace_dir, known_tests.as_ref())?;
         Ok(SchemataBaseline::Passed { coverage })
     }
 
-    /// Run a cargo command that's part of setting up the schemata, rather than a scenario.
+    /// Under cargo test, list the tests, and measure the cost of a run of tests apart from
+    /// the tests themselves.
+    fn list_tests(
+        &self,
+        build_dir: &BuildDir,
+        packages: &PackageSelection,
+        timeouts: Timeouts,
+    ) -> Result<(Option<HashSet<String>>, Duration)> {
+        // Under cargo test, a mutant is attributed to the name of the thread that reached it,
+        // which is a test only if libtest lists it. Listing also measures the cost of a run
+        // apart from the tests themselves: cargo, and starting each test binary.
+        if matches!(self.options.test_tool(), TestTool::Cargo) {
+            let mut args = self.selection_target_args();
+            args.extend(["--".to_owned(), "--list".to_owned()]);
+            let task = self.run_task(
+                build_dir,
+                "schemata_list_tests",
+                Phase::Test,
+                packages,
+                timeouts.test,
+                &args,
+                &[],
+                self.options,
+            )?;
+            if task.success {
+                Ok((Some(listed_tests(&task.log)), task.duration))
+            } else {
+                Ok((None, Duration::ZERO))
+            }
+        } else {
+            Ok((None, Duration::ZERO))
+        }
+    }
+
+    /// Arguments that run only these tests, and a timeout for them.
     ///
-    /// Returns whether it succeeded, and its log.
+    /// The timeout is scaled from the tests' own durations in the baseline, if they're all
+    /// known, plus the cost of any run; otherwise it's the timeout for the whole suite.
+    fn stage_args_and_timeout(
+        &self,
+        tests: &[TestId],
+        timeouts: Timeouts,
+    ) -> Option<(Vec<String>, Option<Duration>)> {
+        let skipped = self.schemata_skipped();
+        let tests = tests
+            .iter()
+            .filter(|test| !skipped.contains(test))
+            .cloned()
+            .collect_vec();
+        let mut args = self.selection_target_args();
+        args.extend(test_args(self.options.test_tool(), Some(&tests), skipped)?);
+        let timeout = self
+            .test_durations
+            .get()
+            .and_then(|known| {
+                let selected = total_duration(&known.durations, &tests)?;
+                Some(selected_tests_timeout(
+                    timeouts.test,
+                    selected,
+                    known.overhead,
+                    self.options,
+                ))
+            })
+            .or(timeouts.test);
+        Some((args, timeout))
+    }
+
+    /// Tests skipped in the schemata build because they fail with no mutant active.
+    fn schemata_skipped(&self) -> &[TestId] {
+        self.schemata_skipped_tests.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Under cargo test, arguments that leave out doctests when running selected tests.
+    ///
+    /// Coverage never selects a doctest, since they don't run on a thread named after the
+    /// test, and building them can take longer than a timeout scaled to the selected tests.
+    /// If the user chose targets themselves, they're left as they are.
+    fn selection_target_args(&self) -> Vec<String> {
+        const TARGET_ARGS: &[&str] = &[
+            "--doc",
+            "--lib",
+            "--bins",
+            "--bin",
+            "--tests",
+            "--test",
+            "--examples",
+            "--example",
+            "--benches",
+            "--bench",
+            "--all-targets",
+        ];
+        let options = self.options;
+        let chose_targets = options
+            .additional_cargo_args
+            .iter()
+            .chain(&options.additional_cargo_test_args)
+            .take_while(|a| *a != "--")
+            .any(|a| {
+                TARGET_ARGS
+                    .iter()
+                    .any(|t| a == t || a.starts_with(&format!("{t}=")))
+            });
+        if matches!(options.test_tool(), TestTool::Cargo) && !chose_targets {
+            vec!["--tests".to_owned()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Run a cargo command that's part of setting up the schemata, rather than a scenario.
     #[allow(clippy::too_many_arguments)]
     fn run_task(
         &self,
@@ -646,7 +907,8 @@ impl Lab<'_> {
         timeout: Option<Duration>,
         extra_args: &[String],
         extra_env: &[(String, String)],
-    ) -> Result<(bool, String)> {
+        options: &Options,
+    ) -> Result<TaskResult> {
         let mut output = self
             .output_mutex
             .lock()
@@ -665,14 +927,18 @@ impl Lab<'_> {
             extra_args,
             extra_env,
             &mut output,
-            self.options,
+            options,
             self.console,
         );
         self.console.task_finished(&console_key);
-        let success = result?.is_success();
+        let phase_result = result?;
         let log_path = output.output_dir.join(output.log_path());
         let log = read_to_string(&log_path).with_context(|| format!("read {log_path}"))?;
-        Ok((success, log))
+        Ok(TaskResult {
+            success: phase_result.is_success(),
+            log,
+            duration: phase_result.duration,
+        })
     }
 }
 
@@ -815,8 +1081,16 @@ impl Worker<'_> {
             "Mutant is switched on in the schemata build by {ACTIVE_ENV}={id}"
         ))?;
         let mut outcome = ScenarioOutcome::new(&scenario_output, scenario.clone());
-        let stages: Vec<Vec<String>> = match tests {
-            None => vec![Vec::new()],
+        // Each stage is the arguments that select its tests, and its timeout.
+        // Every test but those skipped in the schemata build, which could always be named
+        // since the baseline ran with them skipped.
+        let skipped = lab.schemata_skipped();
+        let all_tests = (
+            test_args(lab.options.test_tool(), None, skipped).unwrap_or_default(),
+            timeouts.test,
+        );
+        let stages: Vec<(Vec<String>, Option<Duration>)> = match tests {
+            None => vec![all_tests],
             Some(tests) if tests.is_empty() => {
                 scenario_output.message(
                     "No test reached this mutant in the coverage run, so it's missed without running tests",
@@ -835,20 +1109,20 @@ impl Worker<'_> {
                 .expect("lock kill history")
                 .stages(function_name, tests)
                 .iter()
-                .map(|stage| filterset_args(stage))
+                .map(|stage| lab.stage_args_and_timeout(stage, timeouts))
                 .collect::<Option<Vec<_>>>()
                 // If any tests can't be named, run them all at once.
-                .unwrap_or_else(|| vec![Vec::new()]),
+                .unwrap_or_else(|| vec![all_tests]),
         };
         let env = [(ACTIVE_ENV.to_owned(), id.to_string())];
-        for args in stages {
+        for (args, timeout) in stages {
             lab.console.scenario_phase_started(dir, Phase::Test);
             let phase_result = run_cargo(
                 self.build_dir,
                 lab.jobserver.as_ref(),
                 test_packages,
                 Phase::Test,
-                timeouts.test,
+                timeout,
                 &args,
                 &env,
                 &mut scenario_output,
@@ -862,12 +1136,24 @@ impl Worker<'_> {
                 break;
             }
         }
-        if outcome.mutant_caught() && matches!(lab.options.test_tool(), TestTool::Nextest) {
+        if outcome.mutant_caught() {
             let killers = failed_tests(&outcome.get_log_content()?);
             lab.kill_history
                 .lock()
                 .expect("lock kill history")
                 .record(function_name, &killers);
+        }
+        if outcome.mutant_missed() && !skipped.is_empty() {
+            // One of the skipped tests might have caught it.
+            scenario_output.message(
+                "Missed with some tests skipped in the schemata build: checking again in a build of its own",
+            )?;
+            lab.console.task_finished(dir);
+            lab.schemata_recheck
+                .lock()
+                .expect("lock recheck")
+                .push(mutant.clone());
+            return Ok(outcome);
         }
         lab.finish_scenario(dir, &scenario, &outcome)?;
         Ok(outcome)
@@ -894,5 +1180,28 @@ impl TestsForMutant {
                 TestsForMutant::Explicit(workspace.packages_by_name(package_names))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn without_fail_fast_removes_libtest_fail_fast_and_adds_cargo_no_fail_fast() {
+        let options = Options::from_arg_strs([
+            "mutants",
+            "--",
+            "--fail-fast",
+            "--",
+            "-Zunstable-options",
+            "--fail-fast",
+        ]);
+        let options = without_fail_fast(&options);
+        assert_eq!(options.additional_cargo_args, ["--no-fail-fast"]);
+        assert_eq!(
+            options.additional_cargo_test_args,
+            ["--fail-fast", "--", "-Zunstable-options"]
+        );
     }
 }

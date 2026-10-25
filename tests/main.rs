@@ -3983,3 +3983,71 @@ fn schemata_in_place_restores_source_files() {
         original
     );
 }
+
+#[test]
+fn schemata_no_std_tree_builds_in_one_round_and_selects_tests_by_coverage() {
+    let tmp_src_dir = copy_of_testdata("schemata_no_std");
+    let original = read_to_string(tmp_src_dir.path().join("src/lib.rs")).unwrap();
+    let output = run()
+        .args(["mutants", "--schemata", "--no-shuffle", "-vV"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    println!("{stdout}");
+    // The const fn, the impl Iterator replacements, and the let-chain operator are built
+    // separately, without costing a round of the schemata build.
+    assert!(
+        stdout.contains("Testing 13 mutants in one schemata build; 8 will be built separately")
+    );
+    let out = tmp_src_dir.path().join("mutants.out");
+    assert!(out.join("log/schemata_build_1.log").is_file());
+    assert!(!out.join("log/schemata_build_2.log").exists());
+    assert_eq!(read_to_string(out.join("missed.txt")).unwrap(), "");
+    assert_eq!(
+        read_to_string(tmp_src_dir.path().join("src/lib.rs")).unwrap(),
+        original
+    );
+    // Under cargo test, each switched mutant runs only the tests whose threads reached it.
+    let add_log = read_dir(out.join("log"))
+        .unwrap()
+        .map(|entry| read_to_string(entry.unwrap().path()).unwrap())
+        .find(|log| log.contains("replace add -> u32 with 0"))
+        .expect("log for add mutant");
+    assert!(add_log.contains("--exact test::add_adds"), "{add_log}");
+    assert!(!add_log.contains("test::double_doubles"));
+}
+
+#[test]
+fn schemata_skip_failing_test_skips_it_and_rechecks_missed_mutants_separately() {
+    let tmp_src_dir = copy_of_testdata("schemata_skip_failing_test");
+    run()
+        .args(["mutants", "--schemata", "--no-shuffle", "-vV"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success()
+        .stdout(contains("2 caught"))
+        .stderr(contains(
+            "1 test failed in the schemata build with no mutant active",
+        ));
+    let out = tmp_src_dir.path().join("mutants.out");
+    assert!(out.join("log/schemata_baseline_2.log").is_file());
+    assert_eq!(read_to_string(out.join("missed.txt")).unwrap(), "");
+    // Each mutant was missed in the schemata, with the only test that catches it skipped,
+    // and then caught in a build of its own.
+    let logs = read_dir(out.join("log"))
+        .unwrap()
+        .map(|entry| read_to_string(entry.unwrap().path()).unwrap())
+        .collect_vec();
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.contains("checking again in a build of its own"))
+            .count(),
+        2
+    );
+}

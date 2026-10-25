@@ -46,10 +46,7 @@ pub fn run_cargo(
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
     let mut argv = cargo_argv(packages, phase, options);
-    // Extra args are for cargo or nextest, so must come before any `--` that starts
-    // the args for the test binaries.
-    let extra_at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
-    argv.splice(extra_at..extra_at, extra_args.iter().cloned());
+    add_extra_args(&mut argv, extra_args);
     let mut env = vec![
         // The tests might use Insta <https://insta.rs>, and we don't want it to write
         // updates to the source tree, and we *certainly* don't want it to write
@@ -87,6 +84,27 @@ pub fn run_cargo(
         process_status,
         argv,
     })
+}
+
+/// Add extra arguments to a cargo command line.
+///
+/// Those before any `--` in `extra_args` are for cargo or nextest, so they go before any `--`
+/// already in `argv` that starts the arguments for the test binaries. Those after it are for
+/// the test binaries, so they go at the end, after a `--`.
+fn add_extra_args(argv: &mut Vec<String>, extra_args: &[String]) {
+    let (tool_args, binary_args) = match extra_args.iter().position(|a| a == "--") {
+        Some(i) => (&extra_args[..i], &extra_args[i + 1..]),
+        None => (extra_args, &[][..]),
+    };
+    let separator = argv.iter().position(|a| a == "--");
+    let at = separator.unwrap_or(argv.len());
+    argv.splice(at..at, tool_args.iter().cloned());
+    if !binary_args.is_empty() {
+        if separator.is_none() {
+            argv.push("--".to_owned());
+        }
+        argv.extend(binary_args.iter().cloned());
+    }
 }
 
 /// Extra arguments to make a build phase report compiler errors as JSON.
@@ -228,6 +246,32 @@ mod test {
     };
 
     use super::*;
+
+    #[test]
+    fn add_extra_args_puts_binary_args_after_existing_separator() {
+        let strings = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut argv = strings(&["cargo", "test", "--", "--fail-fast"]);
+        add_extra_args(&mut argv, &strings(&["-E", "x", "--", "--exact", "t::a"]));
+        assert_eq!(
+            argv,
+            strings(&[
+                "cargo",
+                "test",
+                "-E",
+                "x",
+                "--",
+                "--fail-fast",
+                "--exact",
+                "t::a"
+            ])
+        );
+        let mut argv = strings(&["cargo", "test"]);
+        add_extra_args(&mut argv, &strings(&["--", "--list"]));
+        assert_eq!(argv, strings(&["cargo", "test", "--", "--list"]));
+        let mut argv = strings(&["cargo", "test"]);
+        add_extra_args(&mut argv, &strings(&["--message-format=json"]));
+        assert_eq!(argv, strings(&["cargo", "test", "--message-format=json"]));
+    }
 
     #[test]
     fn generate_cargo_args_for_baseline_with_default_options() {

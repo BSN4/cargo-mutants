@@ -168,34 +168,59 @@ pub fn generate(code: &str, mutants: &[(usize, &Mutant)]) -> SchemataFile {
     }
 }
 
+/// Name that generated code uses for the standard library, so that it works in `no_std` crates.
+const STD_ALIAS: &str = "__cargo_mutants_std";
+
+/// Text to append to each crate root while the schemata are built, so that [`STD_ALIAS`]
+/// names the standard library even in a `no_std` crate.
+///
+/// It's an alias so that it can't clash with the `std` most crates already have, and it goes
+/// at the end so that it doesn't move any code whose compiler errors are mapped to mutants.
+pub const CRATE_ROOT_SUFFIX: &str =
+    "\n#[allow(unused_extern_crates)]\nextern crate std as __cargo_mutants_std;\n";
+
+/// The code of [`active_expr`], with `$S` for the standard library, `$IDS` for the site's mutants,
+/// and `$ACTIVE_ENV` and `$TRACE_ENV` for the environment variables.
+const ACTIVE_TEMPLATE: &str = "{ \
+    static ACTIVE: $S::sync::OnceLock<usize> = $S::sync::OnceLock::new(); \
+    static TRACE: $S::sync::OnceLock<$S::option::Option<$S::ffi::OsString>> = \
+    $S::sync::OnceLock::new(); \
+    if let $S::option::Option::Some(dir) = TRACE.get_or_init(|| $S::env::var_os(\"$TRACE_ENV\")) { \
+    $S::thread_local! { static TRACED: $S::cell::Cell<bool> = const { $S::cell::Cell::new(false) }; } \
+    if !TRACED.try_with(|traced| traced.replace(true)).unwrap_or(true) { \
+    let mut line = $S::env::var(\"NEXTEST_BINARY_ID\").unwrap_or_default(); \
+    line.push('\\t'); \
+    match $S::env::var(\"NEXTEST_TEST_NAME\") { \
+    $S::result::Result::Ok(name) => line.push_str(&name), \
+    $S::result::Result::Err(_) => line.push_str($S::thread::current().name().unwrap_or_default()), \
+    } \
+    line.push_str(\"\\t$IDS\\n\"); \
+    let _ = $S::fs::OpenOptions::new().create(true).append(true)\
+    .open($S::path::Path::new(dir).join($S::string::ToString::to_string(&$S::process::id())))\
+    .and_then(|mut f| $S::io::Write::write_all(&mut f, line.as_bytes())); \
+    } } \
+    *ACTIVE.get_or_init(|| $S::env::var(\"$ACTIVE_ENV\").ok().and_then(|v| v.parse().ok()).unwrap_or(0)) }";
+
 /// Expression evaluating to the active mutant id, or 0 for none, at a site holding these mutants.
 ///
 /// This is self-contained so that it works anywhere in any module, and reads the environment
 /// only once per site so that it's cheap inside loops.
 ///
-/// If [`TRACE_ENV`] names a directory, the first time the site is reached in each process
-/// it appends a line to a file there naming the nextest test and the site's mutants: see
-/// [`crate::test_select::Coverage`].
+/// If [`TRACE_ENV`] names a directory, the first time the site is reached on each thread it
+/// appends a line to a file there naming the test and the site's mutants: the nextest test
+/// from the environment, or else the thread's name, which libtest sets to the test's name.
+/// See [`crate::test_select::Coverage`].
 fn active_expr(ids: &[usize]) -> String {
     let ids = ids
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" ");
-    format!(
-        "{{ static ACTIVE: ::std::sync::OnceLock<usize> = ::std::sync::OnceLock::new(); \
-        static TRACED: ::std::sync::Once = ::std::sync::Once::new(); \
-        TRACED.call_once(|| if let Some(dir) = ::std::env::var_os(\"{TRACE_ENV}\") {{ \
-        let mut line = ::std::env::var(\"NEXTEST_BINARY_ID\").unwrap_or_default(); \
-        line.push('\\t'); \
-        line.push_str(&::std::env::var(\"NEXTEST_TEST_NAME\").unwrap_or_default()); \
-        line.push_str(\"\\t{ids}\\n\"); \
-        let _ = ::std::fs::OpenOptions::new().create(true).append(true)\
-        .open(::std::path::Path::new(&dir).join(::std::process::id().to_string()))\
-        .and_then(|mut f| ::std::io::Write::write_all(&mut f, line.as_bytes())); }}); \
-        *ACTIVE.get_or_init(|| ::std::env::var(\"{ACTIVE_ENV}\").ok()\
-        .and_then(|v| v.parse().ok()).unwrap_or(0)) }}"
-    )
+    ACTIVE_TEMPLATE
+        .replace("$S", &format!("::{STD_ALIAS}"))
+        .replace("$IDS", &ids)
+        .replace("$ACTIVE_ENV", ACTIVE_ENV)
+        .replace("$TRACE_ENV", TRACE_ENV)
 }
 
 struct Renderer<'a> {
@@ -242,7 +267,7 @@ impl Renderer<'_> {
                 // An expression is wrapped in a function call rather than parentheses, so that
                 // it parses at the start of a statement and doesn't trigger `unused_parens`.
                 if !body {
-                    self.out.push_str("::std::convert::identity({ ");
+                    write!(self.out, "::{STD_ALIAS}::convert::identity({{ ").unwrap();
                 }
                 let not_active = ids
                     .iter()
@@ -319,8 +344,13 @@ pub struct ErrorLocation {
 
 /// Find the locations of errors in cargo output that includes `--message-format=json` lines.
 ///
+/// Each error gives a list of locations, most relevant first: its primary span, then its other
+/// spans, then those of its notes and suggestions. The primary span isn't always in the code
+/// that caused the error: a match made non-exhaustive by a deleted arm is reported at the
+/// match's scrutinee, but suggests adding the arm back where it was.
+///
 /// Errors without a location, like "aborting due to previous errors", are skipped.
-pub fn error_locations(cargo_output: &str) -> Vec<ErrorLocation> {
+pub fn error_locations(cargo_output: &str) -> Vec<Vec<ErrorLocation>> {
     cargo_output
         .lines()
         .filter(|line| line.starts_with('{'))
@@ -328,18 +358,38 @@ pub fn error_locations(cargo_output: &str) -> Vec<ErrorLocation> {
         .filter(|json| json["reason"] == "compiler-message")
         .map(|json| json["message"].clone())
         .filter(|message| message["level"] == "error")
-        .filter_map(|message| {
-            let spans = message["spans"].as_array()?;
-            let span = spans
-                .iter()
-                .find(|span| span["is_primary"] == true)
-                .or(spans.first())?;
-            Some(ErrorLocation {
-                file_name: Utf8PathBuf::from(span["file_name"].as_str()?),
-                byte_offset: usize::try_from(span["byte_start"].as_u64()?).ok()?,
-            })
+        .map(|message| {
+            let mut locations = Vec::new();
+            add_span_locations(&message, &mut locations);
+            locations
         })
+        .filter(|locations| !locations.is_empty())
         .collect()
+}
+
+/// Add the locations of a diagnostic's spans, primary first, and then of its children.
+fn add_span_locations(diagnostic: &Value, locations: &mut Vec<ErrorLocation>) {
+    let spans = diagnostic["spans"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let (primary, secondary): (Vec<&Value>, Vec<&Value>) =
+        spans.iter().partition(|span| span["is_primary"] == true);
+    for span in primary.into_iter().chain(secondary) {
+        if let (Some(file_name), Some(byte_offset)) = (
+            span["file_name"].as_str(),
+            span["byte_start"]
+                .as_u64()
+                .and_then(|b| usize::try_from(b).ok()),
+        ) {
+            locations.push(ErrorLocation {
+                file_name: Utf8PathBuf::from(file_name),
+                byte_offset,
+            });
+        }
+    }
+    for child in diagnostic["children"].as_array().into_iter().flatten() {
+        add_span_locations(child, locations);
+    }
 }
 
 /// Return the path of a file named in a compiler error relative to the build directory.
@@ -409,7 +459,7 @@ mod test {
         assert_eq!(
             schemata.code,
             format!(
-                "fn f(a: u32) -> bool {{ ::std::convert::identity({{ let {ACTIVE_VAR}: usize = {}; \
+                "fn f(a: u32) -> bool {{ ::{STD_ALIAS}::convert::identity({{ let {ACTIVE_VAR}: usize = {}; \
                 if {ACTIVE_VAR} != 3 {{ a == 1 }} else {{ a != 1 }} }}) }}\n",
                 active_expr(&[3])
             )
@@ -453,7 +503,7 @@ mod test {
             schemata.code,
             format!(
                 "fn f(a: u32) -> u32 {{ let {ACTIVE_VAR}: usize = {active_1}; \
-                if {ACTIVE_VAR} != 1 {{ ::std::convert::identity({{ let {ACTIVE_VAR}: usize = {active_2}; \
+                if {ACTIVE_VAR} != 1 {{ ::{STD_ALIAS}::convert::identity({{ let {ACTIVE_VAR}: usize = {active_2}; \
                 if {ACTIVE_VAR} != 2 {{ a + 1 }} else {{ a - 1 }} }}) }} else {{ 0 }} }}\n"
             )
         );
@@ -515,21 +565,26 @@ mod test {
     }
 
     #[test]
-    fn error_locations_reads_primary_spans_of_errors() {
+    fn error_locations_lists_primary_then_other_spans_then_children() {
         let output = indoc! {r#"
             *** cargo test --no-run
-            {"reason":"compiler-message","message":{"level":"warning","spans":[{"file_name":"src/a.rs","byte_start":1,"is_primary":true}]}}
-            {"reason":"compiler-message","message":{"level":"error","spans":[{"file_name":"src/a.rs","byte_start":5,"is_primary":false},{"file_name":"src/b.rs","byte_start":7,"is_primary":true}]}}
-            {"reason":"compiler-message","message":{"level":"error","spans":[]}}
+            {"reason":"compiler-message","message":{"level":"warning","spans":[{"file_name":"src/a.rs","byte_start":1,"is_primary":true}],"children":[]}}
+            {"reason":"compiler-message","message":{"level":"error","spans":[{"file_name":"src/a.rs","byte_start":5,"is_primary":false},{"file_name":"src/b.rs","byte_start":7,"is_primary":true}],"children":[{"level":"help","spans":[{"file_name":"src/b.rs","byte_start":9,"is_primary":true}],"children":[]}]}}
+            {"reason":"compiler-message","message":{"level":"error","spans":[],"children":[]}}
             {"reason":"build-finished","success":false}
             error: could not compile
         "#};
+        let location = |file_name: &str, byte_offset| ErrorLocation {
+            file_name: file_name.into(),
+            byte_offset,
+        };
         assert_eq!(
             error_locations(output),
-            [ErrorLocation {
-                file_name: "src/b.rs".into(),
-                byte_offset: 7
-            }]
+            [vec![
+                location("src/b.rs", 7),
+                location("src/a.rs", 5),
+                location("src/b.rs", 9)
+            ]]
         );
     }
 }

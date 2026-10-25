@@ -2,7 +2,10 @@
 
 //! Calculation of timeouts for the build and test phases.
 
-use std::{cmp::max, time::Duration};
+use std::{
+    cmp::{max, min},
+    time::Duration,
+};
 
 use tracing::{info, warn};
 
@@ -46,6 +49,34 @@ impl Timeouts {
     }
 }
 
+/// The timeout for running only some of the tests, whose baseline durations add up to
+/// `selected`, in a run that costs `overhead` apart from the tests: scaled like the whole
+/// suite's, but never longer than `full`.
+///
+/// An explicit `--timeout` is the whole suite's timeout, so it's only the upper limit here:
+/// the selected tests' own durations were measured in this run, which makes them as good a
+/// basis as the whole suite's.
+pub fn selected_tests_timeout(
+    full: Option<Duration>,
+    selected: Duration,
+    overhead: Duration,
+    options: &Options,
+) -> Duration {
+    let timeout = scaled_test_timeout(selected, options) + overhead;
+    full.map_or(timeout, |full| min(full, timeout))
+}
+
+/// Scale a baseline test duration by the multiplier, but not below the minimum.
+fn scaled_test_timeout(baseline_duration: Duration, options: &Options) -> Duration {
+    max(
+        options.minimum_test_timeout,
+        Duration::from_secs_f64(
+            (baseline_duration.as_secs_f64() * options.test_timeout_multiplier.unwrap_or(5.0))
+                .ceil(),
+        ),
+    )
+}
+
 const FALLBACK_TIMEOUT_SECS: u64 = 300;
 fn warn_fallback_timeout(phase_name: &str, option: &str) {
     warn!(
@@ -57,13 +88,7 @@ fn test_timeout(baseline_duration: Option<Duration>, options: &Options) -> Durat
     if let Some(explicit) = options.test_timeout {
         explicit
     } else if let Some(baseline_duration) = baseline_duration {
-        let timeout = max(
-            options.minimum_test_timeout,
-            Duration::from_secs_f64(
-                (baseline_duration.as_secs_f64() * options.test_timeout_multiplier.unwrap_or(5.0))
-                    .ceil(),
-            ),
-        );
+        let timeout = scaled_test_timeout(baseline_duration, options);
         if options.show_times {
             info!("Auto-set test timeout to {}s", timeout.as_secs());
         }
@@ -104,6 +129,37 @@ mod test {
 
     use super::*;
     use crate::{Args, config::Config};
+
+    #[test]
+    fn selected_tests_timeout_scales_selected_duration_within_full_timeout() {
+        let options = Options::from_arg_strs([
+            "mutants",
+            "--timeout-multiplier",
+            "3",
+            "--minimum-test-timeout",
+            "5",
+        ]);
+        let full = Some(Duration::from_secs(21));
+        assert_eq!(
+            selected_tests_timeout(full, Duration::from_millis(300), Duration::ZERO, &options),
+            Duration::from_secs(5),
+            "minimum"
+        );
+        assert_eq!(
+            selected_tests_timeout(
+                full,
+                Duration::from_secs(4),
+                Duration::from_secs(1),
+                &options
+            ),
+            Duration::from_secs(13)
+        );
+        assert_eq!(
+            selected_tests_timeout(full, Duration::from_secs(60), Duration::ZERO, &options),
+            Duration::from_secs(21),
+            "never more than the full suite's timeout"
+        );
+    }
 
     #[test]
     fn timeout_multiplier_from_option() {

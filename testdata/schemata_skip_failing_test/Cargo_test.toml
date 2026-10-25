@@ -1,0 +1,9 @@
+[package]
+name = "cargo-mutants-testdata-schemata-skip-failing-test"
+description = "A test that fails in the schemata build's coverage run, like one that counts allocations, and is the only test catching the mutants: so they're missed in the schemata and must be checked again in builds of their own"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+doctest = false

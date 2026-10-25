@@ -144,6 +144,7 @@ pub fn walk_file(
         error_exprs,
         error: None,
         exclude_re_stack: Vec::new(),
+        const_depth: 0,
         external_mods: Vec::new(),
         mutants: Vec::new(),
         mod_namespace_stack: Vec::new(),
@@ -296,6 +297,10 @@ struct DiscoveryVisitor<'o> {
     /// When collecting a mutant, all entries in the stack are checked.
     exclude_re_stack: Vec<RegexSet>,
 
+    /// How many const contexts (const fns, const and static items, array lengths, ...) we're
+    /// inside. Mutants there can't be switched at runtime in the schemata.
+    const_depth: usize,
+
     /// If set, an error occurred during visiting (e.g. invalid regex in an attribute).
     ///
     /// Since `Visit` trait methods cannot return errors, we store the error here
@@ -432,6 +437,8 @@ impl DiscoveryVisitor<'_> {
         genre: Genre,
         switch: Option<Switch>,
     ) {
+        // Reading the active mutant at runtime isn't possible in a const context.
+        let switch = switch.filter(|_| self.const_depth == 0);
         let mutant = Mutant::new_discovered(
             self.source_file.clone(),
             self.fn_stack.last().cloned(),
@@ -492,17 +499,30 @@ impl DiscoveryVisitor<'_> {
                     if orig_block == new_block {
                         trace!("Replacement is the same as the function body; skipping");
                     } else {
-                        let switch = Switch::Expr {
+                        // A replacement for `impl Trait` is a different type from the original,
+                        // so they can't be alternatives in one function.
+                        let switch = (!returns_impl_trait(&sig.output)).then_some(Switch::Expr {
                             span: body_span,
                             body: true,
-                        };
-                        self.collect_mutant(body_span, None, &rep, Genre::FnValue, Some(switch));
+                        });
+                        self.collect_mutant(body_span, None, &rep, Genre::FnValue, switch);
                     }
                 }
             }
         } else {
             warn!("collect_fn_mutants called while not in a function?");
         }
+    }
+
+    /// Call a function inside a const context, if `is_const`.
+    fn in_const_if<F>(&mut self, is_const: bool, f: F)
+    where
+        F: FnOnce(&mut Self),
+    {
+        let depth = usize::from(is_const);
+        self.const_depth += depth;
+        f(self);
+        self.const_depth -= depth;
     }
 
     /// Call a function with a namespace pushed onto the stack.
@@ -583,8 +603,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.in_exclude_re_scope(&i.attrs, |v| {
             let function = v.enter_function(&i.sig.ident, &i.sig.output, i.span());
-            v.collect_fn_mutants(&i.sig, &i.block);
-            syn::visit::visit_item_fn(v, i);
+            v.in_const_if(i.sig.constness.is_some(), |v| {
+                v.collect_fn_mutants(&i.sig, &i.block);
+                syn::visit::visit_item_fn(v, i);
+            });
             v.leave_function(function);
         });
     }
@@ -609,8 +631,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         }
         self.in_exclude_re_scope(&i.attrs, |v| {
             let function = v.enter_function(&i.sig.ident, &i.sig.output, i.span());
-            v.collect_fn_mutants(&i.sig, &i.block);
-            syn::visit::visit_impl_item_fn(v, i);
+            v.in_const_if(i.sig.constness.is_some(), |v| {
+                v.collect_fn_mutants(&i.sig, &i.block);
+                syn::visit::visit_impl_item_fn(v, i);
+            });
             v.leave_function(function);
         });
     }
@@ -633,8 +657,10 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             }
             self.in_exclude_re_scope(&i.attrs, |v| {
                 let function = v.enter_function(&i.sig.ident, &i.sig.output, i.span());
-                v.collect_fn_mutants(&i.sig, block);
-                syn::visit::visit_trait_item_fn(v, i);
+                v.in_const_if(i.sig.constness.is_some(), |v| {
+                    v.collect_fn_mutants(&i.sig, block);
+                    syn::visit::visit_trait_item_fn(v, i);
+                });
                 v.leave_function(function);
             });
         }
@@ -656,7 +682,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("const excluded by attrs");
             return;
         }
-        syn::visit::visit_item_const(self, i);
+        self.in_const_if(true, |v| syn::visit::visit_item_const(v, i));
     }
 
     /// Visit a top-level `static FOO: T = ...;` item.
@@ -675,7 +701,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("static excluded by attrs");
             return;
         }
-        syn::visit::visit_item_static(self, i);
+        self.in_const_if(true, |v| syn::visit::visit_item_static(v, i));
     }
 
     /// Visit an associated `const FOO: T = ...;` inside an `impl` block.
@@ -690,7 +716,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("associated const excluded by attrs");
             return;
         }
-        syn::visit::visit_impl_item_const(self, i);
+        self.in_const_if(true, |v| syn::visit::visit_impl_item_const(v, i));
     }
 
     /// Visit an associated `const FOO: T [= ...];` inside a `trait` block.
@@ -708,7 +734,7 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             trace!("trait associated const excluded by attrs");
             return;
         }
-        syn::visit::visit_trait_item_const(self, i);
+        self.in_const_if(true, |v| syn::visit::visit_trait_item_const(v, i));
     }
 
     /// Visit `impl Foo { ...}` or `impl Debug for Foo { ... }`.
@@ -792,6 +818,37 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         });
     }
 
+    /// Visit `const { ... }` blocks, which are const contexts.
+    fn visit_expr_const(&mut self, i: &'ast syn::ExprConst) {
+        self.in_const_if(true, |v| syn::visit::visit_expr_const(v, i));
+    }
+
+    /// Visit `[x; n]`, whose length is a const context.
+    fn visit_expr_repeat(&mut self, i: &'ast syn::ExprRepeat) {
+        for attr in &i.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_expr(&i.expr);
+        self.in_const_if(true, |v| v.visit_expr(&i.len));
+    }
+
+    /// Visit `[T; n]`, whose length is a const context.
+    fn visit_type_array(&mut self, i: &'ast syn::TypeArray) {
+        self.visit_type(&i.elem);
+        self.in_const_if(true, |v| v.visit_expr(&i.len));
+    }
+
+    /// Visit an enum variant, whose discriminant is a const context.
+    fn visit_variant(&mut self, i: &'ast syn::Variant) {
+        self.in_const_if(true, |v| syn::visit::visit_variant(v, i));
+    }
+
+    /// Visit a generic argument, which is a const context if it's a const expression.
+    fn visit_generic_argument(&mut self, i: &'ast syn::GenericArgument) {
+        let is_const = matches!(i, syn::GenericArgument::Const(_));
+        self.in_const_if(is_const, |v| syn::visit::visit_generic_argument(v, i));
+    }
+
     /// Visit `a op b` expressions.
     fn visit_expr_binary(&mut self, i: &'ast syn::ExprBinary) {
         let _span = trace_span!("binary", line = i.op.span().start().line).entered();
@@ -847,17 +904,18 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 Vec::new()
             }
         };
-        let switch = Switch::Expr {
+        // An operator joining `let` conditions in an `if` can't be wrapped in an expression.
+        let switch = (!(contains_let(&i.left) || contains_let(&i.right))).then_some(Switch::Expr {
             span: i.span().into(),
             body: false,
-        };
+        });
         for rep in replacements {
             self.collect_mutant(
                 i.op.span().into(),
                 None,
                 &rep,
                 Genre::BinaryOperator,
-                Some(switch),
+                switch,
             );
         }
         syn::visit::visit_expr_binary(self, i);
@@ -940,23 +998,23 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 .iter()
                 .flat_map(|arm| &arm.guard)
                 .for_each(|(_if, guard_expr)| {
-                    let switch = Switch::Expr {
+                    let switch = (!contains_let(guard_expr)).then_some(Switch::Expr {
                         span: guard_expr.span().into(),
                         body: false,
-                    };
+                    });
                     v.collect_mutant(
                         guard_expr.span().into(),
                         None,
                         &quote! { true },
                         Genre::MatchArmGuard,
-                        Some(switch),
+                        switch,
                     );
                     v.collect_mutant(
                         guard_expr.span().into(),
                         None,
                         &quote! { false },
                         Genre::MatchArmGuard,
-                        Some(switch),
+                        switch,
                     );
                 });
 
@@ -1020,6 +1078,29 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
             syn::visit::visit_expr_struct(v, i);
         });
     }
+}
+
+/// True if the expression is, or joins with `&&` or `||`, a `let` condition.
+fn contains_let(expr: &Expr) -> bool {
+    match expr {
+        Expr::Let(_) => true,
+        Expr::Binary(binary) => contains_let(&binary.left) || contains_let(&binary.right),
+        Expr::Paren(paren) => contains_let(&paren.expr),
+        _ => false,
+    }
+}
+
+/// True if the return type mentions `impl Trait`.
+fn returns_impl_trait(output: &ReturnType) -> bool {
+    struct FindImplTrait(bool);
+    impl<'ast> Visit<'ast> for FindImplTrait {
+        fn visit_type_impl_trait(&mut self, _i: &'ast syn::TypeImplTrait) {
+            self.0 = true;
+        }
+    }
+    let mut find = FindImplTrait(false);
+    find.visit_return_type(output);
+    find.0
 }
 
 // Get the span of the block excluding the braces, or None if it is empty.

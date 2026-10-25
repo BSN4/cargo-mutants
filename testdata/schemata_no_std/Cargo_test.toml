@@ -1,0 +1,9 @@
+[package]
+name = "cargo-mutants-testdata-schemata-no-std"
+description = "A no_std crate with code that can't be switched at runtime in a schemata build: a const fn, a function returning impl Iterator, and a let-chain"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+doctest = false
