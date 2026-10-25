@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- New: `--schemata` builds all mutants that can be switched at runtime into the tree at once, and then tests each by setting `CARGO_MUTANTS_SCHEMATA_ID`, instead of rebuilding for every mutant. Mutants that don't compile together are found from compiler errors and built separately as before. With nextest, each mutant runs only the tests that reach it, tests that caught nearby mutants run first, and mutants that no test reaches are reported as missed without running tests. This is experimental: see [Building mutants together](https://mutants.rs/schemata.html).
+
+- New: `--cache` reuses outcomes from earlier runs for mutants whose function and the package's integration tests haven't changed, stored in `mutants.out/cache.json`. See [Caching results](https://mutants.rs/cache.html).
+
+- Changed: Duplicate mutants that would produce identical code, for example from repeated `--error` values, are generated only once.
+
 - New: `#[mutants::exclude_re("pattern")]` attribute to exclude specific mutations by regex, without disabling all mutations on the function. The attribute can be placed on functions, `impl` blocks, `trait` blocks, modules, files, and on expressions that can carry an attribute (such as `match`, struct literals, call expressions, method calls, and unary expressions). Multiple patterns can be applied. Also supported within `cfg_attr`. Requires the [mutants](https://crates.io/crates/mutants) crate version `0.0.5` or later.
 
 - Fixed: `#[mutants::skip]` (and `#[cfg_attr(..., mutants::skip)]`) is now honoured when placed on `const` and `static` items, including associated constants in `impl` and `trait` blocks. Previously the attribute was silently ignored on these items and operator mutants inside the initializer expression were still generated ([#508](https://github.com/sourcefrog/cargo-mutants/issues/508)).

@@ -16,7 +16,7 @@ use crate::MUTATION_MARKER_COMMENT;
 use crate::build_dir::BuildDir;
 use crate::output::clean_filename;
 use crate::source::SourceFile;
-use crate::span::Span;
+use crate::span::{LineColumn, Span};
 
 /// Various broad categories of mutants.
 #[derive(Clone, Eq, PartialEq, Debug, Serialize)]
@@ -44,6 +44,21 @@ pub enum MutationTarget {
         /// The name/type of the struct.
         struct_name: String,
     },
+}
+
+/// How a mutant can be turned on at runtime when all mutants are compiled together
+/// (see [`crate::schemata`]).
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
+pub enum Switch {
+    /// Replace `span`, which contains the mutated region, with a runtime choice between
+    /// the mutated and the original text.
+    ///
+    /// `body` is true when the span is the statements of a whole function body, rather
+    /// than one expression.
+    Expr { span: Span, body: bool },
+    /// Delete a match arm by inserting a guard that is false when the mutant is active,
+    /// at this position just after the arm's pattern.
+    ArmGuard { at: LineColumn },
 }
 
 /// A mutation applied to source code.
@@ -88,6 +103,9 @@ pub struct Mutant {
     /// This provides structured information about the mutation target, rather than
     /// encoding it in strings that need to be parsed.
     pub target: Option<MutationTarget>,
+
+    /// How to turn this mutant on at runtime, if it can be compiled together with others.
+    pub switch: Option<Switch>,
 }
 
 /// The function containing a mutant.
@@ -114,6 +132,7 @@ impl Mutant {
     /// This initializes all fields and precomputes the human-readable `name`
     /// (including file path, line/column, and change description) for use in
     /// CLI output, filtering, and JSON.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_discovered(
         source_file: SourceFile,
         function: Option<Arc<Function>>,
@@ -122,6 +141,7 @@ impl Mutant {
         replacement: String,
         genre: Genre,
         target: Option<MutationTarget>,
+        switch: Option<Switch>,
     ) -> Self {
         let mut mutant = Mutant {
             name: String::new(),
@@ -132,6 +152,7 @@ impl Mutant {
             replacement,
             genre,
             target,
+            switch,
         };
         mutant.name = mutant.name(true);
         mutant

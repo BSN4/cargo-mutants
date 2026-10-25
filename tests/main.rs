@@ -3846,3 +3846,121 @@ fn in_diff_with_nonexistent_file_returns_exit_code_6() {
         .code(6)
         .stderr(contains("Failed to read diff file").or(contains("Failed to open diff file")));
 }
+
+#[test]
+fn schemata_on_small_well_tested_tree_catches_all_mutants_in_one_build() {
+    let tmp_src_dir = copy_of_testdata("small_well_tested");
+    run()
+        .args(["mutants", "--schemata", "--no-shuffle", "-vV"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success()
+        .stdout(
+            contains("Testing 4 mutants in one schemata build; 0 will be built separately")
+                .and(contains("4 caught")),
+        );
+    let log_dir = tmp_src_dir.path().join("mutants.out/log");
+    assert!(log_dir.join("schemata_build_1.log").is_file());
+    assert!(!log_dir.join("schemata_build_2.log").exists());
+    assert!(log_dir.join("schemata_baseline.log").is_file());
+    let mutant_log = read_to_string(log_dir.join("src__lib.rs_line_5_col_5.log")).unwrap();
+    assert!(mutant_log.contains("CARGO_MUTANTS_SCHEMATA_ID="));
+    assert!(
+        !mutant_log.contains(" --no-run"),
+        "switched mutants aren't built separately"
+    );
+    // The source is restored after testing the schemata.
+    assert_eq!(
+        read_to_string(tmp_src_dir.path().join("src/lib.rs")).unwrap(),
+        read_to_string("testdata/small_well_tested/src/lib.rs").unwrap()
+    );
+}
+
+#[test]
+fn schemata_on_well_tested_tree_finds_same_outcomes_as_separate_builds() {
+    let tmp_src_dir = copy_of_testdata("well_tested");
+    run()
+        .args(["mutants", "--schemata", "--no-shuffle", "-j2"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success();
+    let schemata_counts = outcome_json_counts(&tmp_src_dir);
+    let tmp_src_dir = copy_of_testdata("well_tested");
+    run()
+        .args(["mutants", "--no-shuffle", "-j2"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success();
+    assert_eq!(schemata_counts, outcome_json_counts(&tmp_src_dir));
+}
+
+#[test]
+fn schemata_with_nextest_records_coverage_and_runs_only_reaching_tests() {
+    let tmp_src_dir = copy_of_testdata("small_well_tested");
+    run()
+        .args([
+            "mutants",
+            "--schemata",
+            "--test-tool",
+            "nextest",
+            "--no-shuffle",
+            "-vV",
+        ])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success()
+        .stdout(contains("4 caught"));
+    let coverage_dir = tmp_src_dir.path().join("mutants.out/schemata_coverage");
+    let coverage = read_dir(&coverage_dir)
+        .unwrap()
+        .map(|entry| read_to_string(entry.unwrap().path()).unwrap())
+        .join("");
+    println!("coverage:\n{coverage}");
+    assert!(coverage.contains("\ttest::test_factorial\t"));
+    let mutant_log = read_to_string(
+        tmp_src_dir
+            .path()
+            .join("mutants.out/log/src__lib.rs_line_5_col_5.log"),
+    )
+    .unwrap();
+    assert!(mutant_log.contains("test(=test::test_factorial)"));
+}
+
+#[test]
+fn cache_reuses_outcomes_of_unchanged_mutants_on_second_run() {
+    let tmp_src_dir = copy_of_testdata("small_well_tested");
+    for _ in 0..2 {
+        run()
+            .args(["mutants", "--cache", "--no-shuffle"])
+            .arg("-d")
+            .arg(tmp_src_dir.path())
+            .assert()
+            .success()
+            .stdout(contains("4 caught"));
+    }
+    let out = tmp_src_dir.path().join("mutants.out");
+    assert!(out.join("cache.json").is_file());
+    assert!(
+        !out.join("log/baseline.log").exists(),
+        "nothing is built when every outcome is cached"
+    );
+    let mutant_log = read_to_string(out.join("log/src__lib.rs_line_5_col_5.log")).unwrap();
+    assert!(mutant_log.contains("Reused outcome Caught from the results cache"));
+
+    // Changing the function invalidates its cached outcomes.
+    let lib_rs = tmp_src_dir.path().join("src/lib.rs");
+    let code = read_to_string(&lib_rs).unwrap();
+    write(&lib_rs, code.replace("let mut a = 1;", "let mut a = 1u32;")).unwrap();
+    run()
+        .args(["mutants", "--cache", "--no-shuffle"])
+        .arg("-d")
+        .arg(tmp_src_dir.path())
+        .assert()
+        .success()
+        .stdout(contains("4 caught"));
+    assert!(out.join("log/baseline.log").is_file());
+}

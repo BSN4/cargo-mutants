@@ -37,13 +37,19 @@ pub fn run_cargo(
     packages: &PackageSelection,
     phase: Phase,
     timeout: Option<Duration>,
+    extra_args: &[String],
+    extra_env: &[(String, String)],
     scenario_output: &mut ScenarioOutput,
     options: &Options,
     console: &Console,
 ) -> Result<PhaseResult> {
     let _span = debug_span!("run", ?phase).entered();
     let start = Instant::now();
-    let argv = cargo_argv(packages, phase, options);
+    let mut argv = cargo_argv(packages, phase, options);
+    // Extra args are for cargo or nextest, so must come before any `--` that starts
+    // the args for the test binaries.
+    let extra_at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    argv.splice(extra_at..extra_at, extra_args.iter().cloned());
     let mut env = vec![
         // The tests might use Insta <https://insta.rs>, and we don't want it to write
         // updates to the source tree, and we *certainly* don't want it to write
@@ -55,6 +61,7 @@ pub fn run_cargo(
         debug!(?encoded_rustflags);
         env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), encoded_rustflags));
     }
+    env.extend(extra_env.iter().cloned());
     let process_status = Process::run(
         &argv,
         &env,
@@ -80,6 +87,14 @@ pub fn run_cargo(
         process_status,
         argv,
     })
+}
+
+/// Extra arguments to make a build phase report compiler errors as JSON.
+pub fn json_message_format_args(options: &Options) -> Vec<String> {
+    match options.test_tool() {
+        TestTool::Cargo => vec!["--message-format=json".to_owned()],
+        TestTool::Nextest => vec!["--cargo-message-format=json".to_owned()],
+    }
 }
 
 /// Return the name of the cargo binary.

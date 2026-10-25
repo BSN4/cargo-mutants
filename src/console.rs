@@ -126,6 +126,11 @@ impl Console {
         }
     }
 
+    /// Update that a cargo task that's not a scenario, like building the schemata, finished.
+    pub fn task_finished(&self, dir: &Utf8Path) {
+        self.view.update(|model| model.remove_scenario(dir));
+    }
+
     pub fn start_copy(&self, dir: &Utf8Path) {
         self.view.update(|model| {
             model.copy_models.push(CopyModel::new(dir.to_owned()));

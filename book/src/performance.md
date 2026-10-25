@@ -9,6 +9,12 @@ will also make normal development more pleasant.
 
 <https://matklad.github.io/2021/09/04/fast-rust-builds.html> has good general advice on making Rust builds and tests faster.
 
+## Build mutants together
+
+[`--schemata`](schemata.md) builds most mutants in one build rather than one build each, and
+with nextest runs only the tests that reach each mutant. [`--cache`](cache.md) skips mutants
+whose code hasn't changed since the last run.
+
 ## Avoid doctests
 
 Rust doctests are pretty slow, because every doctest example becomes a separate

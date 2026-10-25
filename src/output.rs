@@ -19,7 +19,7 @@ use tracing::{info, trace};
 use crate::outcome::{LabOutcome, SummaryOutcome};
 use crate::{Context, Mutant, Result, Scenario, ScenarioOutcome, check_interrupted};
 
-const OUTDIR_NAME: &str = "mutants.out";
+pub const OUTDIR_NAME: &str = "mutants.out";
 const ROTATED_NAME: &str = "mutants.out.old";
 const LOCK_JSON: &str = "lock.json";
 const LOCK_POLL: Duration = Duration::from_millis(100);
@@ -185,11 +185,15 @@ impl OutputDir {
                 scenario_name
             }
         };
-        ScenarioOutput::new(&self.path, scenario, &basename)
+        ScenarioOutput::new(&self.path, scenario, &basename, &scenario.to_string())
+    }
+
+    /// Allocate a log file for a cargo task that's not a scenario, like building the schemata.
+    pub fn start_task(&mut self, name: &str) -> Result<ScenarioOutput> {
+        ScenarioOutput::new(&self.path, &Scenario::Baseline, name, name)
     }
 
     /// Return the path of the `mutants.out` directory.
-    #[allow(unused)]
     pub fn path(&self) -> &Utf8Path {
         &self.path
     }
@@ -297,7 +301,12 @@ pub struct ScenarioOutput {
 }
 
 impl ScenarioOutput {
-    fn new(output_dir: &Utf8Path, scenario: &Scenario, basename: &str) -> Result<Self> {
+    fn new(
+        output_dir: &Utf8Path,
+        scenario: &Scenario,
+        basename: &str,
+        header: &str,
+    ) -> Result<Self> {
         let log_path = Utf8PathBuf::from(format!("log/{basename}.log"));
         let log_file = File::options()
             .append(true)
@@ -315,7 +324,7 @@ impl ScenarioOutput {
             log_file,
             diff_path,
         };
-        scenario_output.message(&scenario.to_string())?;
+        scenario_output.message(header)?;
         Ok(scenario_output)
     }
 

@@ -13,6 +13,7 @@
 
 mod annotation;
 mod build_dir;
+mod cache;
 mod cargo;
 mod config;
 mod console;
@@ -34,10 +35,12 @@ mod path;
 mod pretty;
 mod process;
 mod scenario;
+mod schemata;
 mod shard;
 mod source;
 mod span;
 mod tail_file;
+mod test_select;
 #[cfg(test)]
 #[path = "../tests/util/mod.rs"]
 mod test_util;
@@ -63,6 +66,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     build_dir::BuildDir,
+    cache::ResultCache,
     console::Console,
     exit_code::ExitCode,
     in_diff::diff_filter_file,
@@ -308,6 +312,20 @@ pub struct Args {
     /// This is now the default behavior.
     #[arg(long, help_heading = "Execution")]
     no_shuffle: bool,
+
+    /// Reuse outcomes from earlier runs for mutants whose function, and the package's
+    /// integration tests, haven't changed.
+    ///
+    /// Outcomes are stored in `mutants.out/cache.json`.
+    #[arg(long, help_heading = "Execution")]
+    cache: bool,
+
+    /// Build all mutants that can be switched at runtime in one build, then test each by
+    /// setting an environment variable, rather than building each mutant separately.
+    ///
+    /// Mutants that don't compile together are built and tested one at a time as usual.
+    #[arg(long, help_heading = "Execution")]
+    schemata: bool,
 
     /// Run only one shard of all generated mutants: specify as e.g. 1/4.
     #[arg(long, help_heading = "Execution")]
@@ -623,12 +641,18 @@ fn main() -> Result<ExitCode> {
         print!("{}", list_mutants(&mutants, &options));
         Ok(ExitCode::Success)
     } else {
+        // Load the cache before the output directory holding it is rotated away.
+        let cache = options.cache.then(|| {
+            let cache = ResultCache::load(&output_parent_dir);
+            debug!(n_outcomes = cache.len(), "loaded results cache");
+            cache
+        });
         let output_dir = OutputDir::new(&output_parent_dir)?;
         if let Some(previously_caught) = previously_caught {
             output_dir.write_previously_caught(&previously_caught)?;
         }
         console.set_debug_log(output_dir.open_debug_log()?);
-        let lab_outcome = test_mutants(mutants, &workspace, output_dir, &options, &console)?;
+        let lab_outcome = test_mutants(mutants, &workspace, output_dir, &options, &console, cache)?;
         Ok(lab_outcome.exit_code())
     }
 }

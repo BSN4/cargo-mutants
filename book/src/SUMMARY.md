@@ -30,6 +30,8 @@
   - [Macros](macros.md)
 - [Improving performance](performance.md)
   - [Fail-fast](fail-fast.md)
+  - [Building mutants together (schemata)](schemata.md)
+  - [Caching results](cache.md)
   - [Parallelism](parallelism.md)
   - [Jobserver](jobserver.md)
   - [Sharding](shards.md)

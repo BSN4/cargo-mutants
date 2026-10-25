@@ -27,7 +27,7 @@ use tracing::{debug_span, error, info, trace, trace_span, warn};
 
 use crate::console::WalkProgress;
 use crate::fnvalue::return_type_replacements;
-use crate::mutant::{Function, MutationTarget};
+use crate::mutant::{Function, MutationTarget, Switch};
 use crate::package::Package;
 use crate::pretty::ToPrettyString;
 use crate::source::SourceFile;
@@ -430,6 +430,7 @@ impl DiscoveryVisitor<'_> {
         short_replaced: Option<String>,
         replacement: &TokenStream,
         genre: Genre,
+        switch: Option<Switch>,
     ) {
         let mutant = Mutant::new_discovered(
             self.source_file.clone(),
@@ -439,12 +440,21 @@ impl DiscoveryVisitor<'_> {
             replacement.to_pretty_string(),
             genre,
             None,
+            switch,
         );
         self.push_mutant_if_allowed(mutant);
     }
 
     fn push_mutant_if_allowed(&mut self, mutant: Mutant) {
-        if self.excluded_by_attr_re(&mutant.name) {
+        if self
+            .mutants
+            .iter()
+            .any(|m| m.span == mutant.span && m.replacement == mutant.replacement)
+        {
+            // For example, the same error value given twice, or two return types that
+            // produce the same replacement: the mutated code would be identical.
+            trace!(name = mutant.name(false), "skip duplicate mutant");
+        } else if self.excluded_by_attr_re(&mutant.name) {
             trace!(
                 name = mutant.name(false),
                 "skip mutant by exclude_re attribute"
@@ -482,7 +492,11 @@ impl DiscoveryVisitor<'_> {
                     if orig_block == new_block {
                         trace!("Replacement is the same as the function body; skipping");
                     } else {
-                        self.collect_mutant(body_span, None, &rep, Genre::FnValue);
+                        let switch = Switch::Expr {
+                            span: body_span,
+                            body: true,
+                        };
+                        self.collect_mutant(body_span, None, &rep, Genre::FnValue, Some(switch));
                     }
                 }
             }
@@ -833,8 +847,18 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 Vec::new()
             }
         };
+        let switch = Switch::Expr {
+            span: i.span().into(),
+            body: false,
+        };
         for rep in replacements {
-            self.collect_mutant(i.op.span().into(), None, &rep, Genre::BinaryOperator);
+            self.collect_mutant(
+                i.op.span().into(),
+                None,
+                &rep,
+                Genre::BinaryOperator,
+                Some(switch),
+            );
         }
         syn::visit::visit_expr_binary(self, i);
     }
@@ -848,7 +872,17 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
         self.in_exclude_re_scope(&i.attrs, |v| {
             match i.op {
                 UnOp::Not(_) | UnOp::Neg(_) => {
-                    v.collect_mutant(i.op.span().into(), None, &quote! {}, Genre::UnaryOperator);
+                    let switch = Switch::Expr {
+                        span: i.span().into(),
+                        body: false,
+                    };
+                    v.collect_mutant(
+                        i.op.span().into(),
+                        None,
+                        &quote! {},
+                        Genre::UnaryOperator,
+                        Some(switch),
+                    );
                 }
                 _ => {
                     trace!(
@@ -893,6 +927,9 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                         Some(arm.pat.to_pretty_string()),
                         &replacement,
                         Genre::MatchArm,
+                        Some(Switch::ArmGuard {
+                            at: arm.pat.span().end().into(),
+                        }),
                     );
                 }
             } else {
@@ -903,17 +940,23 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                 .iter()
                 .flat_map(|arm| &arm.guard)
                 .for_each(|(_if, guard_expr)| {
+                    let switch = Switch::Expr {
+                        span: guard_expr.span().into(),
+                        body: false,
+                    };
                     v.collect_mutant(
                         guard_expr.span().into(),
                         None,
                         &quote! { true },
                         Genre::MatchArmGuard,
+                        Some(switch),
                     );
                     v.collect_mutant(
                         guard_expr.span().into(),
                         None,
                         &quote! { false },
                         Genre::MatchArmGuard,
+                        Some(switch),
                     );
                 });
 
@@ -965,6 +1008,9 @@ impl<'ast> Visit<'ast> for DiscoveryVisitor<'_> {
                                 field_name: field_name_str,
                                 struct_name: struct_name.clone(),
                             }),
+                            // Deleting a field can't be switched at runtime without
+                            // evaluating the base expression, so build it separately.
+                            None,
                         );
                         v.push_mutant_if_allowed(mutant);
                     }

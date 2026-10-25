@@ -107,6 +107,12 @@ pub struct Options {
     /// List mutants with line and column numbers.
     pub show_line_col: bool,
 
+    /// Reuse outcomes of unchanged mutants from `mutants.out/cache.json`.
+    pub cache: bool,
+
+    /// Build all switchable mutants together, and choose between them at runtime.
+    pub schemata: bool,
+
     /// Test mutants in random order.
     ///
     /// This is now the default, so that repeated partial runs are more likely to find
@@ -376,6 +382,8 @@ impl Options {
             print_caught: args.caught,
             print_unviable: args.unviable,
             profile: args.profile.as_ref().or(config.profile.as_ref()).cloned(),
+            cache: args.cache,
+            schemata: args.schemata,
             shuffle: args.shuffle,
             show_line_col: args.line_col,
             show_times: !args.no_times,
